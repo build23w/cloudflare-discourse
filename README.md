@@ -1,12 +1,10 @@
 # cloudflare-discourse
 
-**Real Discourse. Entirely on Cloudflare. No servers, no Docker, no build step.**
+Discourse running on Cloudflare Containers, with R2 holding everything that has to survive a restart.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/build23w/cloudflare-discourse)
 
-Discourse is a Rails app that wants Postgres, Redis, Sidekiq and a persistent disk —
-the classic "you need a VPS" workload. This runs it on Cloudflare Containers behind a
-Worker, with R2 for durability, and it **updates itself**.
+Discourse is the poster child for "just get a VPS." It's a big Rails app that expects Postgres, Redis, Sidekiq, and a disk that doesn't disappear out from under it. I wanted to see if it could live on Cloudflare's serverless stack instead. It can, and the result is a forum that costs about as much as a cheap VPS but never needs to be updated, patched, or SSH'd into.
 
 ```
                  ┌─ Cloudflare ──────────────────────────────────────────┐
@@ -23,22 +21,15 @@ Worker, with R2 for durability, and it **updates itself**.
                  └───────────────────────────────────────────────────────┘
 ```
 
-## What makes this different
+## How it works
 
-- **Nothing is built anywhere.** Cloudflare pulls the official `discourse/base` image
-  straight from Docker Hub. Your customization travels as a small bundle in R2 that the
-  container fetches and applies at boot. No local Docker, no CI, no registry push.
-- **It updates itself.** Discourse rebuilds `:release` continuously. Every cold start
-  pulls the newest image and runs `db:migrate`; a nightly cron recycles the container so
-  updates land even with no visitors. **An admin never runs an update.** Plugins are
-  re-cloned each boot, so they track their upstreams too.
-- **Ephemeral disk, durable data.** Uploads go to R2 through Discourse's native S3
-  support. Postgres is dumped to R2 every 15 minutes *and* on SIGTERM (deploys, sleep,
-  nightly recycle), then restored on the next boot.
-- **Assets are cached.** Precompiled assets are stored in R2 keyed by Discourse commit +
-  plugin set, so the expensive ember build happens once per version, not once per boot.
-- **Email included.** Cloudflare Email Service is the default mail path (SMTP submission,
-  implicit TLS on 465, DKIM/ARC signed for you) — no third-party ESP required.
+Nothing gets built, anywhere. Cloudflare pulls the official `discourse/base:release` image straight from Docker Hub, and your customization travels as a small bundle in R2 that the container fetches and applies at boot. You never run Docker on your own machine, and there's no CI pipeline or registry involved.
+
+The self-updating behavior falls out of that design almost for free. Discourse rebuilds the `:release` tag continuously, every cold start pulls whatever is newest and runs `db:migrate`, and a nightly cron recycles the container so updates land even if nobody visits. Plugins are re-cloned on each boot, so they track their upstreams too. You can run this for a year and never type an update command.
+
+The container's disk is ephemeral, so durability lives entirely in R2. Uploads go there directly through Discourse's native S3 support. Postgres gets dumped to R2 every 15 minutes and again on SIGTERM, which covers deploys, sleep, and the nightly recycle; the next boot restores the latest dump. Precompiled assets are cached in R2 as well, keyed by Discourse commit plus plugin set, so the slow ember build happens once per version instead of once per boot.
+
+Mail goes through Cloudflare Email Service by default (SMTP submission with implicit TLS on 465, DKIM and ARC signed for you), so you don't need a third-party ESP unless you want one.
 
 ## Quick start
 
@@ -48,16 +39,13 @@ npm install
 npx wrangler login
 ```
 
-Edit `wrangler.jsonc`: set `DISCOURSE_HOSTNAME`, `DISCOURSE_ADMIN_EMAIL`, and
-`CF_R2_ENDPOINT` (your account ID). Then:
+Edit `wrangler.jsonc`: set `DISCOURSE_HOSTNAME`, `DISCOURSE_ADMIN_EMAIL`, and `CF_R2_ENDPOINT` (your account ID). Then:
 
 ```bash
 npm run bootstrap
 ```
 
-That creates the R2 buckets, uploads the boot bundle, deploys the Worker, and prompts for
-the secrets it needs. First visit boots the container; the very first boot precompiles
-assets (~15-25 min, once), later wakes take a few minutes.
+That creates the R2 buckets, uploads the boot bundle, deploys the Worker, and prompts for the secrets it needs. The first visit boots the container. Fair warning: the very first boot precompiles assets and takes 15 to 25 minutes. It only happens once; later wakes take a few minutes.
 
 ### Secrets
 
@@ -74,52 +62,28 @@ npx wrangler secret put DISCOURSE_ADMIN_PASSWORD
 npx wrangler secret put DISCOURSE_SMTP_PASSWORD
 ```
 
-Email stays globally disabled until `DISCOURSE_SMTP_PASSWORD` exists, then switches on by
-itself. Onboard your sending domain under **Email Service → Email Sending** in the
-dashboard first. Prefer another provider? Point `DISCOURSE_SMTP_ADDRESS`/`_PORT`/
-`_USER_NAME` at it — port 465 uses implicit TLS, anything else uses STARTTLS.
+Email stays globally disabled until `DISCOURSE_SMTP_PASSWORD` exists, then switches on by itself. Onboard your sending domain under Email Service → Email Sending in the dashboard first. If you'd rather use another provider, point `DISCOURSE_SMTP_ADDRESS`/`_PORT`/`_USER_NAME` at it; port 465 uses implicit TLS, anything else uses STARTTLS.
 
 ## Migrating an existing Discourse
 
-Any standard Discourse (a `discourse_docker` VPS install) can be imported without
-downtime on the source:
+Any standard `discourse_docker` install can be imported without taking the source down:
 
 ```bash
 npm run migrate -- --host root@your-server -p 22
 ```
 
-It streams `pg_dump` and local uploads straight into R2, then the next container boot
-restores them, migrates the schema, and rebuilds assets. If your old forum already stores
-uploads on S3/R2, nothing is copied — those settings live in the database and carry over,
-so the new forum keeps serving the same files.
+It streams `pg_dump` and local uploads straight into R2, then the next container boot restores them, migrates the schema, and rebuilds assets. If your old forum already stores uploads on S3 or R2, nothing gets copied. Those settings live in the database and carry over, so the new forum keeps serving the same files.
 
 ## Operating it
 
 ```bash
-npm run update    # only for changes to YOUR files (bundle/worker) — Discourse self-updates
+npm run update    # only for changes to YOUR files (bundle/worker); Discourse updates itself
 npm run logs      # worker tail; container output is in the dashboard
 npm run backup    # force an immediate pg dump to R2
 ```
 
-- Sleeps after 4h idle (compute billing stops); the first visitor gets an auto-refreshing
-  waking page.
-- Scale vertically: `instance_type` in `wrangler.jsonc` + `UNICORN_WORKERS` in `src/index.ts`.
-- Rough cost: Workers Paid $5/mo + container compute while awake + R2 pennies.
-  A small, quiet forum lands around $10-25/mo.
-
-## Trade-offs (read before you commit)
-
-- **Cold starts.** An idle forum takes a few minutes to wake. Set `sleepAfter` longer, or
-  keep it hot with a cron ping, if that matters.
-- **One instance.** `max_instances: 1` by design — Postgres and Redis live inside the
-  container. This scales up, not out. That is how most self-hosted Discourse runs anyway.
-- **Crash window.** A hard crash (no SIGTERM) can lose up to one backup interval. Tune
-  `CF_BACKUP_INTERVAL_SECONDS`. Graceful paths always flush first.
-- **Docker Hub pulls** are uncached and rate-limited for anonymous clients. If wakes ever
-  429, push the base image into Cloudflare's registry once and point `image` at it.
-- **No `docker_manager`.** The in-app update UI is deliberately absent — it has no
-  launcher to drive here. Updates happen by recycling the container.
+The forum sleeps after 4 hours idle and compute billing stops. The first visitor after that gets an auto-refreshing waking page. To scale, bump `instance_type` in `wrangler.jsonc` and `UNICORN_WORKERS` in `src/index.ts`.
 
 ## License
 
-MIT
+MIT****
