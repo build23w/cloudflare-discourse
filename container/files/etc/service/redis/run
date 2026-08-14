@@ -1,0 +1,4 @@
+#!/bin/sh
+exec 2>&1
+install -d -m 0755 -o redis -g redis /shared/redis_data
+exec thpoff chpst -u redis -U redis /usr/bin/redis-server /etc/redis/redis.conf

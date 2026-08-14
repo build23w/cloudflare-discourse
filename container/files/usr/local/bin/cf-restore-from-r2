@@ -1,0 +1,28 @@
+#!/bin/bash
+# Cold-start rehydration: if R2 holds a dump, load it over the image-baked database.
+set -uo pipefail
+source /usr/local/bin/cf-r2-env
+
+if [ -z "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ]; then
+  echo "[cf-restore] no R2 credentials in env — skipping restore"
+  exit 0
+fi
+
+latest="r2:${CF_BACKUP_BUCKET}/pg/latest.sql.gz"
+if [ -z "$(rclone lsf "$latest" 2>/dev/null)" ]; then
+  echo "[cf-restore] no backup found at ${latest} — first boot, keeping fresh database"
+  exit 0
+fi
+
+echo "[cf-restore] restoring from ${latest}"
+rclone cat "$latest" | gunzip | sudo -u postgres psql -q discourse >/tmp/cf-restore.log 2>&1
+
+# --clean --if-exists dumps produce ignorable notices; judge success by the data itself
+users=$(sudo -u postgres psql -tAc "select count(*) from users" discourse 2>/dev/null || echo 0)
+if [ "${users:-0}" -gt 0 ] 2>/dev/null; then
+  echo "[cf-restore] restore complete (${users} users)"
+else
+  echo "[cf-restore] RESTORE LOOKS WRONG — users table empty. Tail of log:"
+  tail -20 /tmp/cf-restore.log
+  exit 1
+fi

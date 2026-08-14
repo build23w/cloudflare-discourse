@@ -1,0 +1,32 @@
+#!/bin/bash
+exec 2>&1
+sv start postgres || exit 1
+sv start redis || exit 1
+cd /var/www/discourse
+chown -R discourse:www-data /shared/log/rails
+
+# Ephemeral disk: rehydrate the database. A pending migration seed wins over the
+# ordinary backup (it only exists once, during the import from another instance).
+/usr/local/bin/cf-migrate-seed
+case $? in
+  0) echo "[cf] migrated from seed" ;;
+  3) /usr/local/bin/cf-restore-from-r2 || echo "[cf] restore failed — continuing with fresh database" ;;
+  *) echo "[cf] MIGRATION FAILED — refusing to start with a half-imported database"; exit 1 ;;
+esac
+
+su discourse -c 'bundle exec rake db:migrate' || exit 1
+
+# Assets are cached in R2 keyed by Discourse SHA + the plugin set, so a full ember
+# build happens only when the forum or its plugins actually change.
+if ! /usr/local/bin/cf-assets-cache extract; then
+  echo "[cf] assets cache miss — precompiling (one time per version, 10-25 min)"
+  su discourse -c 'bundle exec rake assets:precompile' || exit 1
+  /usr/local/bin/cf-assets-cache upload || echo "[cf] assets cache upload failed"
+fi
+
+# admin + settings, applied idempotently once rails is warm
+( sleep 15; su discourse -c 'bundle exec rails runner /usr/local/bin/cf-apply-runtime.rb' ) &
+
+# unicorn_launcher transparently runs pitchfork on modern Discourse
+LD_PRELOAD=$RUBY_ALLOCATOR HOME=/home/discourse USER=discourse exec thpoff chpst -u discourse:www-data -U discourse:www-data \
+  bundle exec config/unicorn_launcher -E production -c config/unicorn.conf.rb

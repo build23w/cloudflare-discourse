@@ -1,0 +1,61 @@
+#!/bin/bash
+# Runs as PID 1 after the entrypoint extracted the bundle to /cf.
+# Turns a stock discourse/base image into a configured all-in-one Discourse.
+set -euo pipefail
+echo "[cf-boot] installing bundle files"
+cp -a /cf/files/usr/. /usr/
+cp -a /cf/files/etc/. /etc/
+chmod 755 /usr/local/bin/cf-* /etc/service/*/run /etc/runit/1.d/* /etc/runit/3.d/*
+
+if ! command -v rclone >/dev/null 2>&1; then
+  echo "[cf-boot] installing rclone"
+  curl -fsSL --retry 3 https://downloads.rclone.org/rclone-current-linux-amd64.deb -o /tmp/rclone.deb \
+    && dpkg -i /tmp/rclone.deb >/dev/null \
+    || echo "[cf-boot] WARNING: rclone install failed — backups/restore disabled this boot"
+fi
+
+# redis under runit: foreground, data on /shared
+sed -i -e 's/^daemonize yes/daemonize no/' -e 's/^pidfile/# pidfile/' -e 's|^dir .*|dir /shared/redis_data|' /etc/redis/redis.conf
+
+# nginx: the same surgery discourse_docker performs at bootstrap
+if [ ! -f /etc/nginx/conf.d/discourse.conf ]; then
+  cp /var/www/discourse/config/nginx.sample.conf /etc/nginx/conf.d/discourse.conf
+  rm -f /etc/nginx/sites-enabled/default
+  mkdir -p /var/nginx/cache /etc/nginx/conf.d/outlets/before-server /etc/nginx/conf.d/outlets/server /etc/nginx/conf.d/outlets/discourse
+  touch /etc/nginx/conf.d/outlets/before-server/20-redirect-http-to-https.conf \
+        /etc/nginx/conf.d/outlets/before-server/30-ratelimited.conf \
+        /etc/nginx/conf.d/outlets/server/20-https.conf \
+        /etc/nginx/conf.d/outlets/server/30-offline-page.conf \
+        /etc/nginx/conf.d/outlets/discourse/20-https.conf \
+        /etc/nginx/conf.d/outlets/discourse/30-ratelimited.conf
+  sed -i 's#listen 80;##g' /etc/nginx/conf.d/discourse.conf
+  echo "listen 80;" > /etc/nginx/conf.d/outlets/server/10-http.conf
+  sed -i 's#pid /run/nginx.pid;#daemon off;#' /etc/nginx/nginx.conf
+  # TLS terminates at Cloudflare's edge; pin the proto header or force_https redirect-loops
+  sed -i 's#proxy_set_header X-Forwarded-Proto $scheme;#proxy_set_header X-Forwarded-Proto https;#g' /etc/nginx/conf.d/discourse.conf
+  sed -i 's#client_max_body_size.*#client_max_body_size 100m;#g' /etc/nginx/conf.d/discourse.conf
+fi
+
+# discourse working dirs + /shared skeleton (mirrors discourse_docker's web template)
+cd /var/www/discourse
+install -d -o discourse -g www-data tmp tmp/pids tmp/sockets
+mkdir -p /shared/log/rails /shared/uploads /shared/backups /shared/tmp/backups /shared/tmp/restores
+touch -a /shared/log/rails/production.log /shared/log/rails/production_errors.log \
+         /shared/log/rails/unicorn.stdout.log /shared/log/rails/unicorn.stderr.log /shared/log/rails/sidekiq.log
+for f in production production_errors unicorn.stdout unicorn.stderr sidekiq; do
+  ln -sf /shared/log/rails/$f.log log/$f.log
+done
+ln -sfn /shared/uploads public/uploads
+ln -sfn /shared/backups public/backups
+ln -sfn /shared/tmp/backups tmp/backups
+ln -sfn /shared/tmp/restores tmp/restores
+chown -R discourse:www-data /shared/log/rails /shared/uploads /shared/backups /shared/tmp
+
+install -d -m 0775 -o postgres -g postgres /shared/postgres_run
+rm -fr /var/run/postgresql
+ln -s /shared/postgres_run /var/run/postgresql
+
+/usr/local/bin/cf-install-plugins || echo "[cf-boot] WARNING: plugin install had failures"
+
+echo "[cf-boot] handing off to runit (/sbin/boot)"
+exec /sbin/boot

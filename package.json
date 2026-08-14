@@ -1,0 +1,25 @@
+{
+  "name": "cloudflare-discourse",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Real Discourse running entirely on Cloudflare: Workers + Containers + R2 + Email Service. No servers, no local Docker, self-updating.",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/build23w/cloudflare-discourse" },
+  "keywords": ["discourse", "cloudflare", "workers", "containers", "r2", "forum", "serverless"],
+  "type": "module",
+  "scripts": {
+    "bootstrap": "node scripts/bootstrap.mjs",
+    "update": "node scripts/update.mjs",
+    "migrate": "node scripts/migrate.mjs",
+    "backup": "node scripts/backup.mjs",
+    "deploy": "wrangler deploy",
+    "logs": "wrangler tail"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260814.1",
+    "wrangler": "^4.123.0"
+  }
+}

@@ -1,0 +1,20 @@
+#!/bin/sh
+exec 2>&1
+PGBIN=/usr/lib/postgresql/18/bin
+install -d -m 0755 -o postgres -g postgres /shared/postgres_data /shared/postgres_run /shared/postgres_backup
+rm -f /shared/postgres_run/.s.PGSQL* /shared/postgres_run/*.pid /shared/postgres_data/postmaster.pid
+mkdir -p /shared/postgres_run/18-main.pg_stat_tmp
+chown -R postgres:postgres /shared/postgres_run
+
+# ephemeral disk: every cold start begins with initdb + create_db (fast), then the
+# unicorn service restores the newest R2 dump on top
+if [ ! -f /shared/postgres_data/PG_VERSION ]; then
+  sudo -E -u postgres $PGBIN/initdb --no-data-checksums --locale-provider=builtin --locale C.UTF-8 -D /shared/postgres_data
+  sudo -E -u postgres $PGBIN/pg_ctl -D /shared/postgres_data -o "-c listen_addresses=''" -w start
+  /usr/local/bin/cf-create-db
+  sudo -E -u postgres $PGBIN/pg_ctl -D /shared/postgres_data -m fast -w stop
+fi
+
+HOME=/var/lib/postgresql USER=postgres exec thpoff chpst -u postgres:postgres:ssl-cert -U postgres:postgres:ssl-cert \
+  $PGBIN/postgres -D /shared/postgres_data \
+  -c shared_buffers=256MB -c work_mem=10MB -c synchronous_commit=off -c max_connections=100

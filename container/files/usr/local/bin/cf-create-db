@@ -1,0 +1,11 @@
+#!/bin/bash
+# discourse_docker's create_db, verbatim in spirit: db + role + required extensions
+su postgres -c 'createdb discourse' || true
+su postgres -c 'psql discourse -c "create user discourse;"' || true
+su postgres -c 'psql discourse -c "grant all privileges on database discourse to discourse;"' || true
+su postgres -c 'psql discourse -c "alter schema public owner to discourse;"'
+for db in template1 discourse; do
+  su postgres -c "psql $db -c 'create extension if not exists hstore;'"
+  su postgres -c "psql $db -c 'create extension if not exists pg_trgm;'"
+  su postgres -c "psql $db -c 'create extension if not exists vector;'"
+done

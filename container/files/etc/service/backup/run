@@ -1,0 +1,7 @@
+#!/bin/bash
+exec 2>&1
+sv start postgres || exit 1
+while true; do
+  sleep "${CF_BACKUP_INTERVAL_SECONDS:-900}"
+  /usr/local/bin/cf-backup-to-r2 || echo "[cf] periodic backup failed"
+done

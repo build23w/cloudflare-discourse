@@ -1,0 +1,48 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-discourse",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "containers": [
+    {
+      "class_name": "Discourse",
+      // Stock public image, pulled BY Cloudflare from Docker Hub. You never build or
+      // push anything: Discourse rebuilds this tag continuously, so every cold start
+      // lands on the latest release. Use ":release-stable" if you prefer the slower
+      // stable channel.
+      "image": "docker.io/discourse/base:release",
+      "max_instances": 1,
+      // standard-2 (1 vCPU / 6 GiB) is fine for a small forum. Bigger forums:
+      // standard-3 or standard-4, and raise UNICORN_WORKERS below to match.
+      "instance_type": "standard-2"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "DISCOURSE", "class_name": "Discourse" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Discourse"] }],
+  // Nightly graceful recycle => the forum updates itself with no admin action.
+  "triggers": { "crons": ["0 8 * * *"] },
+  "r2_buckets": [
+    { "binding": "UPLOADS", "bucket_name": "discourse-uploads" },
+    { "binding": "BACKUPS", "bucket_name": "discourse-backups" }
+  ],
+  "vars": {
+    "DISCOURSE_HOSTNAME": "REPLACE-ME.workers.dev",
+    "DISCOURSE_ADMIN_EMAIL": "you@example.com",
+    "DISCOURSE_ADMIN_USERNAME": "admin",
+    "CF_R2_ENDPOINT": "https://REPLACE-ACCOUNT-ID.r2.cloudflarestorage.com",
+    "CF_R2_UPLOADS_BUCKET": "discourse-uploads",
+    "CF_R2_BACKUPS_BUCKET": "discourse-backups",
+    // Plugins are cloned fresh on every boot, so they update with the forum.
+    // Add your own git URLs, space separated.
+    "CF_PLUGINS": "",
+    // Cloudflare Email Service (SMTP submission, implicit TLS). The username is the
+    // literal string "api_token"; the password is a Cloudflare API token with
+    // "Email Sending: Edit", set via: wrangler secret put DISCOURSE_SMTP_PASSWORD
+    "DISCOURSE_SMTP_ADDRESS": "smtp.mx.cloudflare.net",
+    "DISCOURSE_SMTP_PORT": "465",
+    "DISCOURSE_SMTP_USER_NAME": "api_token"
+  },
+  "observability": { "enabled": true }
+}

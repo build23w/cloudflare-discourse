@@ -1,0 +1,37 @@
+#!/bin/bash
+# One-time import of another Discourse instance.
+# Runs only while migration/pending exists in R2; on success it writes migration/done
+# and removes the marker, so later boots take the ordinary backup-restore path.
+set -uo pipefail
+source /usr/local/bin/cf-r2-env
+command -v rclone >/dev/null 2>&1 || { echo "[cf-migrate] rclone missing"; exit 1; }
+[ -n "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ] || { echo "[cf-migrate] no R2 creds"; exit 1; }
+
+base="r2:${CF_BACKUP_BUCKET}/migration"
+[ -n "$(rclone lsf "$base/pending" 2>/dev/null)" ] || exit 3   # 3 = nothing to migrate
+[ -n "$(rclone lsf "$base/seed.sql.gz" 2>/dev/null)" ] || { echo "[cf-migrate] seed missing"; exit 1; }
+
+echo "[cf-migrate] restoring seed database (this is the big one)"
+# SET ROLE makes every restored object owned by the discourse role even though psql
+# connects as postgres; the dump was taken --no-owner --no-privileges.
+{ echo "SET ROLE discourse;"; rclone cat "$base/seed.sql.gz" | gunzip; } \
+  | sudo -u postgres psql -q -v ON_ERROR_STOP=0 discourse >/tmp/cf-migrate.log 2>&1
+
+posts=$(sudo -u postgres psql -tAc "select count(*) from posts" discourse 2>/dev/null || echo 0)
+if ! [ "${posts:-0}" -gt 0 ] 2>/dev/null; then
+  echo "[cf-migrate] SEED FAILED — posts table empty. Tail of log:"; tail -25 /tmp/cf-migrate.log; exit 1
+fi
+echo "[cf-migrate] seed restored: ${posts} posts"
+
+# Local upload files (thumbnails and any non-S3 originals). The bulk of this forum's
+# uploads already live in its own R2 bucket and are referenced by URL in the database,
+# so they need no copying at all.
+if [ -n "$(rclone lsf "$base/uploads.tgz" 2>/dev/null)" ]; then
+  echo "[cf-migrate] hydrating local uploads"
+  rclone cat "$base/uploads.tgz" | tar xzf - -C /shared || echo "[cf-migrate] uploads extract failed (non-fatal)"
+  chown -R discourse:www-data /shared/uploads || true
+fi
+
+echo "done" | rclone rcat "$base/done" 2>/dev/null || true
+rclone deletefile "$base/pending" 2>/dev/null || true
+echo "[cf-migrate] seed complete"

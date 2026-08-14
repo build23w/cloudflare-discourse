@@ -1,0 +1,31 @@
+#!/bin/bash
+# extract|upload precompiled assets to/from R2, keyed by Discourse SHA + plugin set,
+# so a cached boot is fast and a genuine version change rebuilds exactly once.
+set -uo pipefail
+source /usr/local/bin/cf-r2-env
+cd /var/www/discourse
+sha=$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+plugins=$(ls -1 plugins 2>/dev/null | sort | md5sum | cut -c1-8)
+key="r2:${CF_BACKUP_BUCKET}/assets-cache/assets-${sha}-${plugins}.tar.gz"
+
+case "${1:-}" in
+  extract)
+    [ -n "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ] || exit 1
+    command -v rclone >/dev/null 2>&1 || exit 1
+    [ -n "$(rclone lsf "$key" 2>/dev/null)" ] || { echo "[cf-assets] no cache for ${sha}-${plugins}"; exit 1; }
+    rclone cat "$key" | tar xzf - -C /var/www/discourse || exit 1
+    chown -R discourse:www-data public/assets
+    echo "[cf-assets] extracted cache ${sha}-${plugins}"
+    ;;
+  upload)
+    [ -n "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ] || exit 0
+    command -v rclone >/dev/null 2>&1 || exit 0
+    tar czf /tmp/cf-assets.tgz -C /var/www/discourse public/assets || exit 1
+    rclone copyto /tmp/cf-assets.tgz "$key" || exit 1
+    # keep the cache from growing forever as versions roll by
+    rclone delete "r2:${CF_BACKUP_BUCKET}/assets-cache" --min-age 30d 2>/dev/null || true
+    echo "[cf-assets] uploaded cache ${sha}-${plugins} ($(du -h /tmp/cf-assets.tgz | cut -f1))"
+    ;;
+  *)
+    echo "usage: cf-assets-cache extract|upload"; exit 2 ;;
+esac

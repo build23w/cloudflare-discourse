@@ -1,0 +1,4 @@
+# Everything that lands inside the Linux image must stay LF — CRLF in a runit
+# run file or shell script breaks the container silently.
+* text=auto eol=lf
+scripts/*.ps1 text eol=crlf

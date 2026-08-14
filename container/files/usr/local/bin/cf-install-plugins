@@ -1,0 +1,21 @@
+#!/bin/bash
+# Clone every plugin in $CF_PLUGINS fresh on each boot: plugins therefore track their
+# own upstreams automatically, same as the forum itself.
+# docker_manager is deliberately NOT installed — there is no launcher to drive here,
+# and its "update" UI would be a lie; updates happen by recycling the container.
+set -uo pipefail
+cd /var/www/discourse/plugins || exit 0
+rc=0
+for repo in ${CF_PLUGINS:-}; do
+  name=$(basename "$repo" .git)
+  if [ -d "$name" ]; then continue; fi
+  echo "[cf-plugins] cloning $name"
+  if ! sudo -H -E -u discourse git clone --depth 1 "$repo" "$name" 2>&1 | tail -2; then
+    echo "[cf-plugins] FAILED: $name (continuing without it)"
+    rm -rf "$name"
+    rc=1
+  fi
+done
+chown -R discourse:www-data /var/www/discourse/plugins
+echo "[cf-plugins] installed: $(ls -1 | tr '\n' ' ')"
+exit $rc

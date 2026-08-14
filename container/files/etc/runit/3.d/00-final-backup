@@ -1,0 +1,4 @@
+#!/bin/bash
+# SIGTERM (deploy rollover or sleep) grants up to 15 minutes of grace — snapshot first
+echo "[cf] shutdown: taking final backup"
+/usr/local/bin/cf-backup-to-r2 || true

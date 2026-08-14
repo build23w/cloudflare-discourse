@@ -1,0 +1,4 @@
+#!/bin/bash
+# identical mechanism to discourse_docker: materialize DISCOURSE_* env into discourse.conf
+conf=/var/www/discourse/config/discourse.conf
+/usr/local/bin/ruby -e 'ENV.each{|k,v| puts "#{$1.downcase} = '\''#{v}'\''" if k =~ /^DISCOURSE_(.*)/}' | install -m 600 -o discourse /dev/stdin ${conf}

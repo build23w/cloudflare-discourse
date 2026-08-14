@@ -1,0 +1,3 @@
+#!/bin/bash
+sv stop unicorn
+sv stop backup
