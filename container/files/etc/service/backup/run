@@ -11,8 +11,13 @@ until sudo -u postgres psql -tAc "select 1" discourse >/dev/null 2>&1; do sleep 
 until [ "$(sudo -u postgres psql -tAc 'select count(*) from posts' discourse 2>/dev/null || echo 0)" -gt 0 ]; do sleep 20; done
 sleep 60
 /usr/local/bin/cf-backup-to-r2 || echo "[cf] initial backup failed"
+/usr/local/bin/cf-ship-logs || true
 
 while true; do
-  sleep "${CF_BACKUP_INTERVAL_SECONDS:-900}"
+  # Ship logs more often than backups: errors are what you need mid-incident.
+  for _ in 1 2 3; do
+    sleep "$(( ${CF_BACKUP_INTERVAL_SECONDS:-900} / 3 ))"
+    /usr/local/bin/cf-ship-logs || true
+  done
   /usr/local/bin/cf-backup-to-r2 || echo "[cf] periodic backup failed"
 done

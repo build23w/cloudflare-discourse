@@ -49,4 +49,20 @@ safely("s3 uploads (fresh install only)") do
   end
 end
 
+safely("smtp report") do
+  puts "[cf-apply-runtime] smtp=#{GlobalSetting.respond_to?(:smtp_address) ? GlobalSetting.smtp_address : "?"} " \
+       "port=#{GlobalSetting.try(:smtp_port)} disable_emails=#{SiteSetting.disable_emails} " \
+       "notification_email=#{SiteSetting.notification_email}"
+end
+
+# One-shot deliverability check. Set CF_TEST_EMAIL for a boot, read the result in
+# R2 (logs/cf-runtime.tail.log), then unset it.
+if !ENV["CF_TEST_EMAIL"].to_s.empty?
+  safely("test email to #{ENV["CF_TEST_EMAIL"]}") do
+    message = TestMailer.send_test(ENV["CF_TEST_EMAIL"])
+    Email::Sender.new(message, :test_message).send
+    puts "[cf-apply-runtime] TEST EMAIL ACCEPTED BY SMTP -> #{ENV["CF_TEST_EMAIL"]}"
+  end
+end
+
 puts "[cf-apply-runtime] done"

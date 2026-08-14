@@ -10,8 +10,18 @@ chown -R discourse:www-data /shared/log/rails
 /usr/local/bin/cf-migrate-seed
 case $? in
   0) echo "[cf] migrated from seed" ;;
-  3) /usr/local/bin/cf-restore-from-r2 || echo "[cf] restore failed — continuing with fresh database" ;;
-  *) echo "[cf] MIGRATION FAILED — refusing to start with a half-imported database"; exit 1 ;;
+  3)
+    # No migration pending: restore the newest backup instead.
+    /usr/local/bin/cf-restore-from-r2
+    case $? in
+      0) echo "[cf] restored from backup" ;;
+      3) echo "[cf] no backup exists — starting a genuinely fresh forum" ;;
+      # A backup exists but would not restore. Serving now would replace a live forum
+      # with an empty one, so refuse: runit retries, and the old data stays safe in R2.
+      *) echo "[cf] RESTORE FAILED WITH A BACKUP PRESENT — refusing to serve an empty forum"; sleep 30; exit 1 ;;
+    esac
+    ;;
+  *) echo "[cf] MIGRATION FAILED — refusing to start with a half-imported database"; sleep 30; exit 1 ;;
 esac
 
 su discourse -c 'bundle exec rake db:migrate' || exit 1
@@ -24,8 +34,10 @@ if ! /usr/local/bin/cf-assets-cache extract; then
   /usr/local/bin/cf-assets-cache upload || echo "[cf] assets cache upload failed"
 fi
 
-# admin + settings, applied idempotently once rails is warm
-( sleep 15; su discourse -c 'bundle exec rails runner /usr/local/bin/cf-apply-runtime.rb' ) &
+# admin + settings, applied idempotently once rails is warm. Output goes to a log that
+# cf-ship-logs publishes to R2, since there is no shell into this container.
+( sleep 15; su discourse -c 'bundle exec rails runner /usr/local/bin/cf-apply-runtime.rb' \
+    > /shared/log/rails/cf-runtime.log 2>&1; /usr/local/bin/cf-ship-logs || true ) &
 
 # unicorn_launcher transparently runs pitchfork on modern Discourse
 LD_PRELOAD=$RUBY_ALLOCATOR HOME=/home/discourse USER=discourse exec thpoff chpst -u discourse:www-data -U discourse:www-data \

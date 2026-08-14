@@ -1,28 +1,49 @@
 #!/bin/bash
-# Cold-start rehydration: if R2 holds a dump, load it over the image-baked database.
+# Cold-start rehydration from the newest pg dump in R2.
+#
+# Exit codes are load-bearing:
+#   0 = restored successfully
+#   3 = there is genuinely NO backup in R2 (first ever boot) — a fresh database is correct
+#   1 = a backup EXISTS but could not be restored — the caller MUST refuse to serve,
+#       because seeding an empty forum over a live domain destroys the site.
 set -uo pipefail
 source /usr/local/bin/cf-r2-env
 
-if [ -z "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ]; then
-  echo "[cf-restore] no R2 credentials in env — skipping restore"
-  exit 0
-fi
+status() {
+  echo "[cf-restore] $1: $2"
+  command -v rclone >/dev/null 2>&1 || return 0
+  [ -n "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ] || return 0
+  printf '%s\n' "$(date -u +%FT%TZ) $1 $2" | rclone rcat "r2:${CF_BACKUP_BUCKET}/boot/last-restore.txt" 2>/dev/null || true
+}
+
+if ! command -v rclone >/dev/null 2>&1; then status FAIL "rclone missing"; exit 1; fi
+if [ -z "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ]; then status FAIL "CF_R2_ACCESS_KEY_ID missing from service env"; exit 1; fi
 
 latest="r2:${CF_BACKUP_BUCKET}/pg/latest.sql.gz"
-if [ -z "$(rclone lsf "$latest" 2>/dev/null)" ]; then
-  echo "[cf-restore] no backup found at ${latest} — first boot, keeping fresh database"
-  exit 0
-fi
 
-echo "[cf-restore] restoring from ${latest}"
-rclone cat "$latest" | gunzip | sudo -u postgres psql -q discourse >/tmp/cf-restore.log 2>&1
-
-# --clean --if-exists dumps produce ignorable notices; judge success by the data itself
-users=$(sudo -u postgres psql -tAc "select count(*) from users" discourse 2>/dev/null || echo 0)
-if [ "${users:-0}" -gt 0 ] 2>/dev/null; then
-  echo "[cf-restore] restore complete (${users} users)"
-else
-  echo "[cf-restore] RESTORE LOOKS WRONG — users table empty. Tail of log:"
-  tail -20 /tmp/cf-restore.log
+# `rclone size` is used instead of `lsf` deliberately: lsf on a file path can return
+# empty, which previously read as "no backup exists" and seeded a fresh forum.
+bytes=$(rclone size "$latest" --json 2>/tmp/cf-size.err | grep -o '"bytes":[0-9-]*' | cut -d: -f2)
+if [ -z "${bytes:-}" ] || [ "${bytes:-0}" -le 0 ] 2>/dev/null; then
+  if grep -qi "not found\|directory not found\|doesn't exist" /tmp/cf-size.err 2>/dev/null; then
+    status NONE "no backup in R2 — first boot, fresh database is correct"
+    exit 3
+  fi
+  status FAIL "cannot determine backup size: $(tail -c 200 /tmp/cf-size.err | tr '\n' ' ')"
   exit 1
 fi
+status START "restoring ${bytes} bytes from pg/latest.sql.gz"
+
+if ! rclone cat "$latest" | gunzip | sudo -u postgres psql -q -v ON_ERROR_STOP=0 discourse >/tmp/cf-restore.log 2>&1; then
+  status FAIL "psql restore pipeline failed: $(tail -c 300 /tmp/cf-restore.log | tr '\n' ' ')"
+  exit 1
+fi
+
+posts=$(sudo -u postgres psql -tAc "select count(*) from posts" discourse 2>/dev/null || echo 0)
+users=$(sudo -u postgres psql -tAc "select count(*) from users" discourse 2>/dev/null || echo 0)
+if ! [ "${posts:-0}" -gt 0 ] 2>/dev/null; then
+  status FAIL "restore produced an empty forum (posts=${posts} users=${users}): $(tail -c 300 /tmp/cf-restore.log | tr '\n' ' ')"
+  exit 1
+fi
+
+status OK "restored ${posts} posts / ${users} users"

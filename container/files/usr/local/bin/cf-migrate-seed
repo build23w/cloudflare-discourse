@@ -8,8 +8,11 @@ command -v rclone >/dev/null 2>&1 || { echo "[cf-migrate] rclone missing"; exit 
 [ -n "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ] || { echo "[cf-migrate] no R2 creds"; exit 1; }
 
 base="r2:${CF_BACKUP_BUCKET}/migration"
-[ -n "$(rclone lsf "$base/pending" 2>/dev/null)" ] || exit 3   # 3 = nothing to migrate
-[ -n "$(rclone lsf "$base/seed.sql.gz" 2>/dev/null)" ] || { echo "[cf-migrate] seed missing"; exit 1; }
+# `rclone size` rather than `lsf`: lsf on a file path can return empty even when the
+# object exists, which silently skips the import.
+have() { local b; b=$(rclone size "$1" --json 2>/dev/null | grep -o '"bytes":[0-9-]*' | cut -d: -f2); [ -n "${b:-}" ] && [ "${b:-0}" -gt 0 ] 2>/dev/null; }
+have "$base/pending" || exit 3   # 3 = nothing to migrate
+have "$base/seed.sql.gz" || { echo "[cf-migrate] seed missing"; exit 1; }
 
 echo "[cf-migrate] restoring seed database (this is the big one)"
 # SET ROLE makes every restored object owned by the discourse role even though psql
