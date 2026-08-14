@@ -51,6 +51,13 @@ export class Discourse extends Container<Env> {
       DISCOURSE_DB_SOCKET: "/var/run/postgresql",
       // Cloudflare fronts the container: trust its forwarded client IP
       DISCOURSE_REAL_IP_HEADER: "CF-Connecting-IP",
+      // Cloudflare fronts the container, so rate limiting must trust its edge ranges
+      // or every visitor is attributed to a handful of CF IPs.
+      DISCOURSE_TRUSTED_PROXIES:
+        "127.0.0.1, 173.245.48.0/20, 103.21.244.0/22, 103.22.200.0/22, 103.31.4.0/22, 141.101.64.0/18, 108.162.192.0/18, 190.93.240.0/20, 188.114.96.0/20, 197.234.240.0/22, 198.41.128.0/17, 162.158.0.0/15, 104.16.0.0/13, 104.24.0.0/14, 172.64.0.0/13, 131.0.72.0/22",
+      // Master switch for cross-origin API reads (embedding latest.json widgets on
+      // other sites); the allowed-origins list is the cors_origins site setting.
+      DISCOURSE_ENABLE_CORS: "true",
       DISCOURSE_SKIP_EMAIL_SETUP: smtpOn ? "0" : "1",
       ...(smtpOn
         ? {
@@ -108,14 +115,47 @@ function wantsHtml(request: Request): boolean {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const container = getContainer(env.DISCOURSE, "forum");
+    const url = new URL(request.url);
+
+    // Canonical funnel: non-canonical hosts and plain HTTP 301 to the forum hostname
+    // over https, so links, cookies and SEO all converge on one origin.
+    if (env.DISCOURSE_HOSTNAME && !env.DISCOURSE_HOSTNAME.includes("REPLACE-ME") &&
+        (url.hostname !== env.DISCOURSE_HOSTNAME || url.protocol === "http:")) {
+      url.hostname = env.DISCOURSE_HOSTNAME;
+      url.protocol = "https:";
+      return Response.redirect(url.toString(), 301);
+    }
+
+    // Edge-cache immutable static assets: Discourse fingerprints everything under
+    // these paths and serves it with max-age=1y, but a Worker route bypasses zone
+    // caching — without this, every asset request wakes Rails.
+    const cacheable = request.method === "GET" && /^\/(assets|stylesheets|images|svg-sprite|fonts)\//.test(url.pathname);
+    const cache = caches.default;
+    if (cacheable) {
+      const hit = await cache.match(request);
+      if (hit) return hit;
+    }
+
     const headers = new Headers(request.headers);
     headers.set("X-Forwarded-Proto", "https");
     const proxied = new Request(request, { headers });
     try {
       const res = await container.fetch(proxied);
       if ((res.status === 502 || res.status === 503) && wantsHtml(request)) return wakingResponse();
+      if (cacheable && res.status === 200 && (res.headers.get("cache-control") ?? "").includes("max-age")) {
+        const copy = new Response(res.body, res);
+        copy.headers.set("strict-transport-security", "max-age=31536000");
+        const [toClient, toCache] = [copy.clone(), copy];
+        ctx.waitUntil(cache.put(request, toCache));
+        return toClient;
+      }
+      if (wantsHtml(request) && res.status === 200) {
+        const page = new Response(res.body, res);
+        page.headers.set("strict-transport-security", "max-age=31536000");
+        return page;
+      }
       return res;
     } catch {
       if (wantsHtml(request)) return wakingResponse();
