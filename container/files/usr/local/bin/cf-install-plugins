@@ -4,18 +4,37 @@
 # docker_manager is deliberately NOT installed — there is no launcher to drive here,
 # and its "update" UI would be a lie; updates happen by recycling the container.
 set -uo pipefail
-cd /var/www/discourse/plugins || exit 0
+
+if [ -z "${CF_PLUGINS:-}" ]; then
+  echo "[cf-plugins] CF_PLUGINS is empty or unset — no plugins to install"
+  exit 0
+fi
+
+dir=/var/www/discourse/plugins
+mkdir -p "$dir"
+cd "$dir" || { echo "[cf-plugins] cannot cd to $dir"; exit 1; }
+echo "[cf-plugins] target=$dir owner=$(stat -c '%U:%G' "$dir") git=$(command -v git || echo MISSING)"
+
 rc=0
-for repo in ${CF_PLUGINS:-}; do
+for repo in $CF_PLUGINS; do
   name=$(basename "$repo" .git)
-  if [ -d "$name" ]; then continue; fi
-  echo "[cf-plugins] cloning $name"
-  if ! sudo -H -E -u discourse git clone --depth 1 "$repo" "$name" 2>&1 | tail -2; then
-    echo "[cf-plugins] FAILED: $name (continuing without it)"
+  [ -d "$name" ] && { echo "[cf-plugins] $name already present"; continue; }
+  echo "[cf-plugins] cloning $name from $repo"
+  if sudo -H -E -u discourse git clone --depth 1 "$repo" "$name" 2>&1 | sed 's/^/[cf-plugins]   /'; then
+    echo "[cf-plugins] OK $name"
+  else
+    echo "[cf-plugins] FAILED $name — retrying as root"
     rm -rf "$name"
-    rc=1
+    if git clone --depth 1 "$repo" "$name" 2>&1 | sed 's/^/[cf-plugins]   /'; then
+      echo "[cf-plugins] OK $name (root clone)"
+    else
+      echo "[cf-plugins] GAVE UP on $name — continuing without it"
+      rm -rf "$name"
+      rc=1
+    fi
   fi
 done
-chown -R discourse:www-data /var/www/discourse/plugins
-echo "[cf-plugins] installed: $(ls -1 | tr '\n' ' ')"
+
+chown -R discourse:www-data "$dir"
+echo "[cf-plugins] installed: $(ls -1 "$dir" | tr '\n' ' ')"
 exit $rc

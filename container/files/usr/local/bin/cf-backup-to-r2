@@ -1,19 +1,35 @@
 #!/bin/bash
-# pg_dump -> gzip -> R2. Runs every 15 min, plus once more on SIGTERM.
+# pg_dump -> gzip -> R2, plus a small status object so backup health is visible
+# from outside the container (no shell access required).
 set -uo pipefail
 source /usr/local/bin/cf-r2-env
 
-if [ -z "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ]; then
-  echo "[cf-backup] no R2 credentials in env — skipping backup"
-  exit 0
-fi
+status() {  # status <state> <detail>
+  echo "[cf-backup] $1: $2"
+  command -v rclone >/dev/null 2>&1 || return 0
+  [ -n "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ] || return 0
+  printf '%s\n' "$(date -u +%FT%TZ) $1 $2" | rclone rcat "r2:${CF_BACKUP_BUCKET}/boot/last-backup.txt" 2>/dev/null || true
+}
+
+if ! command -v rclone >/dev/null 2>&1; then status FAIL "rclone not installed"; exit 1; fi
+if [ -z "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ]; then status FAIL "CF_R2_ACCESS_KEY_ID missing from service env"; exit 1; fi
 
 ts=$(date -u +%Y%m%d-%H%M%S)
 tmp=/tmp/cf-pg-backup.sql.gz
-sudo -u postgres pg_dump --clean --if-exists discourse | gzip > "$tmp" || { echo "[cf-backup] pg_dump failed"; exit 1; }
-[ -s "$tmp" ] || { echo "[cf-backup] empty dump — refusing to upload"; exit 1; }
+rm -f "$tmp"
 
-rclone copyto "$tmp" "r2:${CF_BACKUP_BUCKET}/pg/backup-${ts}.sql.gz" || exit 1
-rclone copyto "$tmp" "r2:${CF_BACKUP_BUCKET}/pg/latest.sql.gz" || exit 1
+if ! sudo -u postgres pg_dump --clean --if-exists discourse 2>/tmp/cf-pgdump.err | gzip -6 > "$tmp"; then
+  status FAIL "pg_dump: $(tail -c 300 /tmp/cf-pgdump.err | tr '\n' ' ')"
+  exit 1
+fi
+sz=$(stat -c %s "$tmp" 2>/dev/null || echo 0)
+[ "$sz" -gt 1000 ] || { status FAIL "dump too small (${sz} bytes)"; exit 1; }
+
+if ! rclone copyto "$tmp" "r2:${CF_BACKUP_BUCKET}/pg/backup-${ts}.sql.gz" 2>/tmp/cf-rclone.err; then
+  status FAIL "upload: $(tail -c 300 /tmp/cf-rclone.err | tr '\n' ' ')"
+  exit 1
+fi
+rclone copyto "$tmp" "r2:${CF_BACKUP_BUCKET}/pg/latest.sql.gz" 2>/dev/null || { status FAIL "latest upload failed"; exit 1; }
 rclone delete "r2:${CF_BACKUP_BUCKET}/pg" --include "backup-*" --min-age 14d 2>/dev/null || true
-echo "[cf-backup] uploaded pg/backup-${ts}.sql.gz ($(du -h "$tmp" | cut -f1))"
+
+status OK "pg/backup-${ts}.sql.gz ($(numfmt --to=iec "$sz" 2>/dev/null || echo "${sz}B"))"

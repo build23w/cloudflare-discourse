@@ -1,6 +1,17 @@
 #!/bin/bash
 exec 2>&1
 sv start postgres || exit 1
+
+# Wait for the database to actually accept connections. The first boot after a
+# migration spends minutes restoring, and a dump taken mid-restore is worthless.
+until sudo -u postgres psql -tAc "select 1" discourse >/dev/null 2>&1; do sleep 10; done
+
+# Back up as soon as the forum is usable, then on the interval. Backing up only after
+# a full interval leaves a window where a cold start has no snapshot to restore.
+until [ "$(sudo -u postgres psql -tAc 'select count(*) from posts' discourse 2>/dev/null || echo 0)" -gt 0 ]; do sleep 20; done
+sleep 60
+/usr/local/bin/cf-backup-to-r2 || echo "[cf] initial backup failed"
+
 while true; do
   sleep "${CF_BACKUP_INTERVAL_SECONDS:-900}"
   /usr/local/bin/cf-backup-to-r2 || echo "[cf] periodic backup failed"

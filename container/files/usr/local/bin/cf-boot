@@ -2,6 +2,10 @@
 # Runs as PID 1 after the entrypoint extracted the bundle to /cf.
 # Turns a stock discourse/base image into a configured all-in-one Discourse.
 set -euo pipefail
+# Keep a copy of everything this script prints; it is shipped to R2 at the end so boot
+# problems are diagnosable without shell access to the container.
+exec > >(tee -a /tmp/cf-boot.log) 2>&1
+echo "[cf-boot] === boot $(date -u +%FT%TZ) ==="
 echo "[cf-boot] installing bundle files"
 cp -a /cf/files/usr/. /usr/
 cp -a /cf/files/etc/. /etc/
@@ -56,6 +60,14 @@ rm -fr /var/run/postgresql
 ln -s /shared/postgres_run /var/run/postgresql
 
 /usr/local/bin/cf-install-plugins || echo "[cf-boot] WARNING: plugin install had failures"
+
+# Ship the boot log to R2 before runit takes over the process.
+if command -v rclone >/dev/null 2>&1; then
+  # shellcheck source=/dev/null
+  source /usr/local/bin/cf-r2-env
+  rclone copyto /tmp/cf-boot.log "r2:${CF_BACKUP_BUCKET}/boot/last-boot.log" 2>/dev/null \
+    && echo "[cf-boot] boot log uploaded to R2" || true
+fi
 
 echo "[cf-boot] handing off to runit (/sbin/boot)"
 exec /sbin/boot
