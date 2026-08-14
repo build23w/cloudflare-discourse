@@ -29,7 +29,26 @@ if ! rclone copyto "$tmp" "r2:${CF_BACKUP_BUCKET}/pg/backup-${ts}.sql.gz" 2>/tmp
   status FAIL "upload: $(tail -c 300 /tmp/cf-rclone.err | tr '\n' ' ')"
   exit 1
 fi
+
+# Shrink guard. A container that boots with a failed restore contains a fresh, nearly
+# empty Discourse; without this it would dump that and overwrite the only good backup,
+# after which every later boot faithfully restores an empty forum. The timestamped copy
+# above is always kept, so nothing is lost either way.
+prev=$(rclone size "r2:${CF_BACKUP_BUCKET}/pg/latest.sql.gz" --json 2>/dev/null | grep -o '"bytes":[0-9-]*' | cut -d: -f2)
+if [ -n "${prev:-}" ] && [ "${prev:-0}" -gt 0 ] 2>/dev/null && [ "$sz" -lt $(( prev / 2 )) ]; then
+  status REFUSED "dump ${sz}B is under half of existing latest ${prev}B — keeping the old latest, saved as backup-${ts}"
+  exit 1
+fi
+
 rclone copyto "$tmp" "r2:${CF_BACKUP_BUCKET}/pg/latest.sql.gz" 2>/dev/null || { status FAIL "latest upload failed"; exit 1; }
+
+# Record the largest post count this forum has ever had, so a restore can recognise a
+# truncated dump instead of trusting any non-empty database.
+posts=$(sudo -u postgres psql -tAc "select count(*) from posts" discourse 2>/dev/null | tr -dc '0-9')
+hw=$(rclone cat "r2:${CF_BACKUP_BUCKET}/boot/high-water.txt" 2>/dev/null | tr -dc '0-9')
+if [ -n "${posts:-}" ] && [ "${posts:-0}" -gt "${hw:-0}" ] 2>/dev/null; then
+  printf '%s\n' "$posts" | rclone rcat "r2:${CF_BACKUP_BUCKET}/boot/high-water.txt" 2>/dev/null || true
+fi
 rclone delete "r2:${CF_BACKUP_BUCKET}/pg" --include "backup-*" --min-age 14d 2>/dev/null || true
 
 status OK "pg/backup-${ts}.sql.gz ($(numfmt --to=iec "$sz" 2>/dev/null || echo "${sz}B"))"

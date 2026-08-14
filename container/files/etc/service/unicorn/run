@@ -2,11 +2,39 @@
 exec 2>&1
 sv start postgres || exit 1
 sv start redis || exit 1
+
+# runit calls a service "up" the moment its process starts, but postgres is not
+# accepting connections yet — and on a cold disk it runs initdb + create_db first.
+# Restoring before that point fails with "no such file or directory" on the socket,
+# which is how a live forum previously got replaced by an empty one.
+tries=0
+until sudo -u postgres psql -tAc "select 1" discourse >/dev/null 2>&1; do
+  tries=$((tries + 1))
+  if [ "$tries" -gt 180 ]; then
+    echo "[cf] postgres never accepted connections after 15 minutes — refusing to continue"
+    sleep 30
+    exit 1
+  fi
+  [ $((tries % 12)) -eq 1 ] && echo "[cf] waiting for postgres to accept connections (${tries})"
+  sleep 5
+done
+echo "[cf] postgres is ready"
+
 cd /var/www/discourse
 chown -R discourse:www-data /shared/log/rails
 
-# Ephemeral disk: rehydrate the database. A pending migration seed wins over the
-# ordinary backup (it only exists once, during the import from another instance).
+# Hydrate the database ONCE per container. runit re-executes this script every time
+# pitchfork exits — a crash, an OOM kill, `sv restart` — and without this sentinel each
+# of those would replay a --clean dump over the LIVE database, destroying everything
+# written since the last snapshot. The disk is ephemeral, so the sentinel is naturally
+# absent on a genuine cold start, which is exactly when hydration is wanted.
+SENTINEL=/shared/.cf-hydrated
+if [ -f "$SENTINEL" ]; then
+  echo "[cf] database already hydrated this container; skipping restore"
+else
+
+# A pending migration seed wins over the ordinary backup (it exists only during an
+# import from another instance).
 /usr/local/bin/cf-migrate-seed
 case $? in
   0) echo "[cf] migrated from seed" ;;
@@ -23,6 +51,9 @@ case $? in
     ;;
   *) echo "[cf] MIGRATION FAILED — refusing to start with a half-imported database"; sleep 30; exit 1 ;;
 esac
+
+touch "$SENTINEL"
+fi
 
 su discourse -c 'bundle exec rake db:migrate' || exit 1
 

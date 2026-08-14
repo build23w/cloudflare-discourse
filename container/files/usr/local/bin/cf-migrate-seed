@@ -4,6 +4,14 @@
 # and removes the marker, so later boots take the ordinary backup-restore path.
 set -uo pipefail
 source /usr/local/bin/cf-r2-env
+
+status() {  # published to R2 so a skipped or failed import is visible from outside
+  echo "[cf-migrate] $1: $2"
+  command -v rclone >/dev/null 2>&1 || return 0
+  [ -n "${RCLONE_CONFIG_R2_ACCESS_KEY_ID:-}" ] || return 0
+  printf '%s\n' "$(date -u +%FT%TZ) $1 $2" | rclone rcat "r2:${CF_BACKUP_BUCKET}/boot/last-seed.txt" 2>/dev/null || true
+}
+
 command -v rclone >/dev/null 2>&1 || { echo "[cf-migrate] rclone missing"; exit 1; }
 [ -n "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ] || { echo "[cf-migrate] no R2 creds"; exit 1; }
 
@@ -21,10 +29,14 @@ echo "[cf-migrate] restoring seed database (this is the big one)"
   | sudo -u postgres psql -q -v ON_ERROR_STOP=0 discourse >/tmp/cf-migrate.log 2>&1
 
 posts=$(sudo -u postgres psql -tAc "select count(*) from posts" discourse 2>/dev/null || echo 0)
-if ! [ "${posts:-0}" -gt 0 ] 2>/dev/null; then
-  echo "[cf-migrate] SEED FAILED — posts table empty. Tail of log:"; tail -25 /tmp/cf-migrate.log; exit 1
+# A real forum import is thousands of posts. A handful means Discourse seeded its own
+# sample content instead, so treat that as failure and keep the marker armed.
+floor="${CF_SEED_POST_FLOOR:-1000}"
+if ! [ "${posts:-0}" -ge "$floor" ] 2>/dev/null; then
+  status FAIL "seed produced only ${posts} posts (floor ${floor}): $(tail -c 300 /tmp/cf-migrate.log | tr '\n' ' ')"
+  exit 1
 fi
-echo "[cf-migrate] seed restored: ${posts} posts"
+status OK "seed restored ${posts} posts"
 
 # Local upload files (thumbnails and any non-S3 originals). The bulk of this forum's
 # uploads already live in its own R2 bucket and are referenced by URL in the database,

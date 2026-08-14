@@ -46,4 +46,13 @@ if ! [ "${posts:-0}" -gt 0 ] 2>/dev/null; then
   exit 1
 fi
 
+# High-water check. A stock Discourse has a handful of seeded posts, so "greater than
+# zero" cannot tell a real forum from a fresh install. Compare against the largest post
+# count ever backed up: a restore that loses 10% of the forum is a failure, not a success.
+hw=$(rclone cat "r2:${CF_BACKUP_BUCKET}/boot/high-water.txt" 2>/dev/null | tr -dc '0-9')
+if [ -n "${hw:-}" ] && [ "${hw:-0}" -gt 0 ] 2>/dev/null && [ "$posts" -lt $(( hw * 9 / 10 )) ] 2>/dev/null; then
+  status FAIL "restored only ${posts} posts but this forum has had ${hw} — refusing to accept a truncated restore"
+  exit 1
+fi
+
 status OK "restored ${posts} posts / ${users} users"
