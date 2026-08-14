@@ -6,7 +6,7 @@ source /usr/local/bin/cf-r2-env
 command -v rclone >/dev/null 2>&1 || exit 0
 [ -n "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ] || exit 0
 
-for f in production_errors cf-runtime unicorn.stderr; do
+for f in production production_errors cf-runtime unicorn.stderr unicorn.stdout; do
   src="/shared/log/rails/$f.log"
   [ -f "$src" ] || continue
   tail -c 300000 "$src" | rclone rcat "r2:${CF_BACKUP_BUCKET}/logs/${f}.tail.log" 2>/dev/null || true
