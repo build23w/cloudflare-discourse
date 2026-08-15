@@ -5,15 +5,45 @@
 # and its "update" UI would be a lie; updates happen by recycling the container.
 set -uo pipefail
 
-if [ -z "${CF_PLUGINS:-}" ]; then
-  echo "[cf-plugins] CF_PLUGINS is empty or unset — no plugins to install"
-  exit 0
-fi
-
 dir=/var/www/discourse/plugins
 mkdir -p "$dir"
 cd "$dir" || { echo "[cf-plugins] cannot cd to $dir"; exit 1; }
 echo "[cf-plugins] target=$dir owner=$(stat -c '%U:%G' "$dir") git=$(command -v git || echo MISSING)"
+
+# Prune unwanted bundled plugins BEFORE assets:precompile runs. The base image ships
+# ~49 plugins; every one with frontend assets costs ember build time and ships JS to
+# every anonymous reader. Pruning is the single biggest lever for cheap instances:
+# a chat-free 11-plugin build precompiles in ~85s at 0.5 vCPU, versus 20+ minutes for
+# the full set even at 4 vCPU. When the env var is unset nothing is pruned; the shipped
+# wrangler.jsonc prefills it with the optional/integration plugins a fresh forum has
+# nothing configured for, which is what makes the first standard-1 build minutes
+# instead of tens of minutes. Runs on every boot because the image is fresh each time.
+# Database tables left behind by a removed plugin are harmless; dropping a name from
+# CF_REMOVE_PLUGINS restores it on the next boot.
+CF_REMOVE_PLUGINS="${CF_REMOVE_PLUGINS:-}"
+if [ -n "$CF_REMOVE_PLUGINS" ]; then
+  removed=0
+  # noglob for the word split: the shell's cwd is the plugins directory itself, so an
+  # unquoted '*' in the list would otherwise expand into every installed plugin name
+  # BEFORE the per-name checks run. With expansion off, glob characters survive as
+  # literals and the case guard below refuses them.
+  set -f
+  for name in $CF_REMOVE_PLUGINS; do
+    # Never let a typo or a stray value delete something outside this directory,
+    # and never accept a name that could act as a pattern instead of a directory.
+    case "$name" in */*|.|..|""|*[*?[]*) echo "[cf-plugins] refusing unsafe removal name: '$name'"; continue ;; esac
+    if [ -d "$dir/$name" ]; then
+      rm -rf "${dir:?}/${name:?}" && removed=$((removed + 1))
+    fi
+  done
+  set +f
+  echo "[cf-plugins] pruned $removed of $(echo "$CF_REMOVE_PLUGINS" | wc -w) requested plugins"
+fi
+
+if [ -z "${CF_PLUGINS:-}" ]; then
+  echo "[cf-plugins] CF_PLUGINS is empty or unset — no plugins to install"
+  exit 0
+fi
 
 rc=0
 for repo in $CF_PLUGINS; do

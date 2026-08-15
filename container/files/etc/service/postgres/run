@@ -1,9 +1,19 @@
 #!/bin/sh
 exec 2>&1
-PGBIN=/usr/lib/postgresql/18/bin
+# The base image floats, so a postgres major bump moves /usr/lib/postgresql/<ver>.
+# Resolve the newest installed version instead of pinning one: a hardcoded path
+# bricks every boot on the first image after a bump.
+PGBIN=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)
+if [ -z "$PGBIN" ]; then
+  echo "[cf] FATAL: no postgres installation under /usr/lib/postgresql — cannot start the database"
+  sleep 30
+  exit 1
+fi
+PGVER=$(basename "$(dirname "$PGBIN")")
+echo "[cf] postgres ${PGVER} at ${PGBIN}"
 install -d -m 0755 -o postgres -g postgres /shared/postgres_data /shared/postgres_run /shared/postgres_backup
 rm -f /shared/postgres_run/.s.PGSQL* /shared/postgres_run/*.pid /shared/postgres_data/postmaster.pid
-mkdir -p /shared/postgres_run/18-main.pg_stat_tmp
+mkdir -p "/shared/postgres_run/${PGVER}-main.pg_stat_tmp"
 chown -R postgres:postgres /shared/postgres_run
 
 # ephemeral disk: every cold start begins with initdb + create_db (fast), then the

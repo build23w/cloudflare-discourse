@@ -1,5 +1,13 @@
 #!/bin/bash
-exec 2>&1
+# Everything this pipeline prints — including the multi-minute asset build, otherwise
+# a black box — lands in a SHIPPED log (cf-ship-logs pushes it to R2 every ~5 min),
+# so a wedged boot is diagnosable in one read instead of guessed at. Phase stamps mark
+# where time goes.
+mkdir -p /shared/log/rails
+exec > >(tee -a /shared/log/rails/unicorn.stdout.log) 2>&1
+phase() { echo "[cf-phase $(date -u +%H:%M:%S)] $1"; }
+
+phase "unicorn/run start (pid $$)"
 sv start postgres || exit 1
 sv start redis || exit 1
 
@@ -20,8 +28,40 @@ until sudo -u postgres psql -tAc "select 1" discourse >/dev/null 2>&1; do
 done
 echo "[cf] postgres is ready"
 
+# Cap WAL on a small disk: the default max_wal_size of 1GB is more than the free space
+# a standard-1 (8GB) container runs with, and postgres hitting ENOSPC takes the whole
+# forum down. More frequent checkpoints are a fair trade at this traffic level.
+sudo -u postgres psql -qc "ALTER SYSTEM SET max_wal_size = '256MB'" 2>/dev/null \
+  && sudo -u postgres psql -qc "SELECT pg_reload_conf()" >/dev/null 2>&1 \
+  || echo "[cf] warning: could not cap max_wal_size"
+
 cd /var/www/discourse
+
+# Theme-JS transpiles that finish in seconds at 4 vCPU exceed AssetProcessor's
+# stock 15s ceiling at 0.5 vCPU, which turns any theme change (or the theme
+# rebuild a Discourse update forces) into sitewide 500s while every request
+# retries the compile. 120s keeps it bounded but survivable. Written fresh each
+# boot so self-updates cannot drop it; the rescue makes a future rename of the
+# class degrade to stock behavior instead of a boot failure.
+cat > config/initializers/zzz-cf-asset-timeout.rb <<'EOF'
+Rails.application.config.to_prepare do
+  begin
+    AssetProcessor.timeout = 120_000
+  rescue NameError
+  end
+end
+EOF
+chown discourse:www-data config/initializers/zzz-cf-asset-timeout.rb
 chown -R discourse:www-data /shared/log/rails
+
+# Stock pitchfork HARDCODES a 30s production timeout — ENV["UNICORN_TIMEOUT"] is only
+# honored in the dev branch, so the env var alone is a dead knob. At 0.5 vCPU a
+# first-touch asset compile can exceed 30s, so patch the production line to the
+# configured value. Pattern-guarded: if upstream changes the line, this no-ops.
+if [ -n "${UNICORN_TIMEOUT:-}" ] && grep -qE '^\s*timeout 30\s*$' config/pitchfork.conf.rb 2>/dev/null; then
+  sed -i -E "s/^(\s*)timeout 30\s*$/\1timeout ${UNICORN_TIMEOUT}/" config/pitchfork.conf.rb
+  echo "[cf] pitchfork production timeout -> ${UNICORN_TIMEOUT}s"
+fi
 
 # Hydrate the database ONCE per container. runit re-executes this script every time
 # pitchfork exits — a crash, an OOM kill, `sv restart` — and without this sentinel each
@@ -55,15 +95,22 @@ esac
 touch "$SENTINEL"
 fi
 
-su discourse -c 'bundle exec rake db:migrate' || exit 1
+phase "hydration decided — starting db:migrate"
+su discourse -c 'bundle exec rake db:migrate' || { phase "MIGRATE FAILED"; exit 1; }
+# The shutdown hook keys on this second sentinel: hydrated + migrated together mean
+# the schema is whole, so a SIGTERM from here on may safely dump the database.
+touch /shared/.cf-migrated
+phase "migrate done — starting assets"
 
-# Assets are cached in R2 keyed by Discourse SHA + the plugin set, so a full ember
-# build happens only when the forum or its plugins actually change.
-if ! /usr/local/bin/cf-assets-cache extract; then
-  echo "[cf] assets cache miss — precompiling (one time per version, 10-25 min)"
-  su discourse -c 'bundle exec rake assets:precompile' || exit 1
-  /usr/local/bin/cf-assets-cache upload || echo "[cf] assets cache upload failed"
-fi
+# Always precompile — never restore a prebaked asset archive. The base image is
+# rebuilt continuously under an unchanging Discourse sha, and an archive banked on
+# one image build can be unrenderable on the next (missing core bundles) while
+# passing every file-count check. A build on every boot is the only asset state
+# that provably matches the image the boot pulled; with a pruned plugin set it is
+# a couple of minutes even at 0.5 vCPU.
+phase "full precompile beginning (always built fresh)"
+su discourse -c 'bundle exec rake assets:precompile' || { phase "PRECOMPILE FAILED"; exit 1; }
+phase "assets ready — starting pitchfork"
 
 # admin + settings, applied idempotently once rails is warm. Output goes to a log that
 # cf-ship-logs publishes to R2, since there is no shell into this container.

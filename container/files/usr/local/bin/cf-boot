@@ -17,6 +17,12 @@ if ! command -v rclone >/dev/null 2>&1; then
     && dpkg -i /tmp/rclone.deb >/dev/null \
     || echo "[cf-boot] WARNING: rclone install failed — backups/restore disabled this boot"
 fi
+# All rclone settings arrive as RCLONE_CONFIG_R2_* env vars (cf-r2-env), so no config
+# file is ever written — and a missing config makes every rclone run print a NOTICE to
+# stderr. Scripts inspect rclone's stderr for real errors; give it an empty config so
+# that channel stays clean. cf-r2-env pins RCLONE_CONFIG to this same path.
+mkdir -p /root/.config/rclone
+[ -f /root/.config/rclone/rclone.conf ] || : > /root/.config/rclone/rclone.conf
 
 # redis under runit: foreground, data on /shared
 sed -i -e 's/^daemonize yes/daemonize no/' -e 's/^pidfile/# pidfile/' -e 's|^dir .*|dir /shared/redis_data|' /etc/redis/redis.conf

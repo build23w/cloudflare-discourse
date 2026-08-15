@@ -12,9 +12,18 @@
       // stable channel.
       "image": "docker.io/discourse/base:release",
       "max_instances": 1,
-      // standard-2 (1 vCPU / 6 GiB) is fine for a small forum. Bigger forums:
-      // standard-3 or standard-4, and raise UNICORN_WORKERS below to match.
-      "instance_type": "standard-2"
+      // Cheapest tier that runs Discourse: 0.5 vCPU / 4 GiB / 8 GB disk, ~$0.074/hr
+      // while running — roughly $54/mo if the forum never sleeps, and sleep costs $0,
+      // so a low-traffic forum bills a fraction of that. standard-4 is ~5.5x the
+      // price. The one heavy moment is the asset precompile after a Discourse update:
+      // it fits in 4 GiB only while the plugin set stays lean, which is exactly what
+      // CF_REMOVE_PLUGINS below is for. If post-update boots start thrashing after
+      // you add plugins, step up to standard-2 and raise UNICORN_WORKERS with it.
+      "instance_type": "standard-1"
+      // Larger option for big plugin sets or heavy traffic — standard-4 gives
+      // 4 vCPU / 12 GiB / 20 GB (~5.5x the cost at 24/7). With it, a full
+      // unpruned-plugin precompile drops from tens of minutes to ~1 minute:
+      // "instance_type": "standard-4"
     }
   ],
   "durable_objects": {
@@ -26,6 +35,11 @@
   "r2_buckets": [
     { "binding": "UPLOADS", "bucket_name": "discourse-uploads" },
     { "binding": "BACKUPS", "bucket_name": "discourse-backups" }
+    // Optional: durable page-snapshot tier. The Worker persists every anonymous page
+    // it serves and replays it while the container sleeps or boots — pages stay up
+    // during wakes instead of showing the waking screen. Create the bucket, then
+    // uncomment this line (it carries its own leading comma):
+    // ,{ "binding": "SNAPSHOTS", "bucket_name": "discourse-snapshots" }
   ],
   "vars": {
     "DISCOURSE_HOSTNAME": "REPLACE-ME.workers.dev",
@@ -37,12 +51,64 @@
     // Plugins are cloned fresh on every boot, so they update with the forum.
     // Add your own git URLs, space separated.
     "CF_PLUGINS": "",
+    // Bundled plugins to DELETE before the asset build, space separated, named as
+    // their directories under /var/www/discourse/plugins. Pruning unused plugins is
+    // the single biggest lever on a cheap instance: a full unpruned first build on
+    // standard-1 is slow — expect 20+ minutes of billed container time — while this
+    // pruned default precompiles in a couple of minutes. Later boots reuse the R2
+    // asset cache either way, and a pruned plugin returns (tables intact) on the
+    // next boot after you delete its name from the list.
+    // The prefill removes only optional plugins a fresh forum has nothing configured
+    // for. Delete a name from the list to keep that feature:
+    //   chat + discourse-chat-integration + automation — keep or remove these three
+    //     TOGETHER: chat requires automation and chat-integration requires chat, so
+    //     removing one without the others fails the boot.
+    //   discourse-apple-auth, discourse-microsoft-auth, discourse-login-with-amazon,
+    //     discourse-oauth2-basic, discourse-openid-connect, discourse-lti — login
+    //     providers that do nothing until configured with app credentials.
+    //   discourse-zendesk-plugin, discourse-patreon, discourse-github,
+    //     discourse-subscriptions, discourse-affiliate, discourse-adplugin,
+    //     discourse-rss-polling — third-party integrations, inert unconfigured.
+    "CF_REMOVE_PLUGINS": "chat discourse-chat-integration automation discourse-apple-auth discourse-microsoft-auth discourse-login-with-amazon discourse-oauth2-basic discourse-openid-connect discourse-lti discourse-zendesk-plugin discourse-patreon discourse-github discourse-subscriptions discourse-affiliate discourse-adplugin discourse-rss-polling",
+    // Half a vCPU compiles a missed asset in tens of seconds; stock pitchfork
+    // hardcodes a 30s production timeout (its UNICORN_TIMEOUT env read is dev-only)
+    // that kills those compiles mid-flight and surfaces as 500s. The container's
+    // unicorn run script seds that hardcoded line to this value at boot. 180s gives
+    // the first hit after a cold boot room to finish; repeats come from the disk cache.
+    "UNICORN_TIMEOUT": "180",
+    // Optional: web (unicorn) worker count. The default of 3 fits standard-1
+    // alongside postgres, redis and sidekiq — raise it only when you raise
+    // instance_type.
+    // "UNICORN_WORKERS": "5",
+    // Optional: import sanity floor used by cf-migrate-seed — a migration dump that
+    // restores to fewer posts than this is treated as a failed seed (Discourse
+    // planted its own sample content) and the import stays armed for a retry.
+    // Defaults to 1000; lower it when importing a genuinely small forum.
+    // "CF_SEED_POST_FLOOR": "1000",
     // Cloudflare Email Service (SMTP submission, implicit TLS). The username is the
     // literal string "api_token"; the password is a Cloudflare API token with
     // "Email Sending: Edit", set via: wrangler secret put DISCOURSE_SMTP_PASSWORD
     "DISCOURSE_SMTP_ADDRESS": "smtp.mx.cloudflare.net",
     "DISCOURSE_SMTP_PORT": "465",
     "DISCOURSE_SMTP_USER_NAME": "api_token"
+    // Secrets — never plaintext vars; set each with `wrangler secret put <NAME>`:
+    //   R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY — R2 API token for the two buckets
+    //   DISCOURSE_ADMIN_PASSWORD — seeds the admin account on first boot
+    //   DISCOURSE_SMTP_PASSWORD — setting it switches outbound email on
+    //   CF_OPS_KEY — unlocks the /_cf/* ops endpoints (restart etc.); off when unset
   },
+  // Optional: per-IP rate limit on requests that reach the container (edge-cache
+  // hits are exempt) — keeps a bot flood from holding the container awake 24/7.
+  // Uncomment to enable; it needs no extra resources.
+  // "unsafe": {
+  //   "bindings": [
+  //     {
+  //       "name": "WAKE_LIMITER",
+  //       "type": "ratelimit",
+  //       "namespace_id": "1001",
+  //       "simple": { "limit": 60, "period": 60 }
+  //     }
+  //   ]
+  // },
   "observability": { "enabled": true }
 }

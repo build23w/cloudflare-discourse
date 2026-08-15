@@ -7,4 +7,8 @@ export RCLONE_CONFIG_R2_ACCESS_KEY_ID="${CF_R2_ACCESS_KEY_ID:-}"
 export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="${CF_R2_SECRET_ACCESS_KEY:-}"
 export RCLONE_CONFIG_R2_ENDPOINT="${CF_R2_ENDPOINT:-}"
 export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
+# Pin the config path to the empty file cf-boot creates: without one, every rclone
+# run prints a missing-config NOTICE to stderr regardless of which HOME the calling
+# runit service inherited, polluting the stderr that scripts inspect for real errors.
+export RCLONE_CONFIG=/root/.config/rclone/rclone.conf
 export CF_BACKUP_BUCKET="${CF_R2_BACKUPS_BUCKET:-discourse-backups}"

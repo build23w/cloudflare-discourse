@@ -1,4 +1,11 @@
 #!/bin/bash
-# SIGTERM (deploy rollover or sleep) grants up to 15 minutes of grace — snapshot first
-echo "[cf] shutdown: taking final backup"
-/usr/local/bin/cf-backup-to-r2 || true
+# SIGTERM (deploy rollover or sleep) grants up to 15 minutes of grace — snapshot first,
+# but only if the boot actually finished. Until BOTH sentinels exist the database is
+# mid-restore or mid-migrate, and a dump taken then captures a half-built forum that
+# the backup pipeline would then promote over the last good snapshot.
+if [ -f /shared/.cf-hydrated ] && [ -f /shared/.cf-migrated ]; then
+  echo "[cf] shutdown: taking final backup"
+  /usr/local/bin/cf-backup-to-r2 || true
+else
+  echo "[cf] shutdown during boot (hydrate/migrate incomplete) — skipping final backup"
+fi

@@ -1,6 +1,9 @@
 #!/bin/bash
-# pg_dump -> gzip -> R2, plus a small status object so backup health is visible
-# from outside the container (no shell access required).
+# pg_dump -> gzip -> streamed STRAIGHT to R2; the dump never touches local disk.
+# A standard-1 disk (8GB) runs with only a few hundred MB free, and staging the dump
+# locally can hit ENOSPC mid-gzip and upload a silently truncated archive. Streaming
+# removes the disk from the failure surface entirely; completeness is proven by
+# re-reading the object.
 set -uo pipefail
 source /usr/local/bin/cf-r2-env
 
@@ -14,41 +17,76 @@ status() {  # status <state> <detail>
 if ! command -v rclone >/dev/null 2>&1; then status FAIL "rclone not installed"; exit 1; fi
 if [ -z "$RCLONE_CONFIG_R2_ACCESS_KEY_ID" ]; then status FAIL "CF_R2_ACCESS_KEY_ID missing from service env"; exit 1; fi
 
+B="r2:${CF_BACKUP_BUCKET}"
 ts=$(date -u +%Y%m%d-%H%M%S)
-tmp=/tmp/cf-pg-backup.sql.gz
-rm -f "$tmp"
+obj="pg/backup-${ts}.sql.gz"
 
-if ! sudo -u postgres pg_dump --clean --if-exists discourse 2>/tmp/cf-pgdump.err | gzip -6 > "$tmp"; then
-  status FAIL "pg_dump: $(tail -c 300 /tmp/cf-pgdump.err | tr '\n' ' ')"
+# Disk observability, published every cycle. A free-space refusal guard would block
+# every backup on a small instance; streaming needs no local space, so publish the
+# numbers instead and let pressure be visible before it bites.
+free_mb=$(df -m / | awk 'NR==2 {print $4}')
+{ df -m /; du -sm /var/www/discourse /shared/log /var/lib/postgresql /tmp 2>/dev/null | sort -rn; } \
+  | rclone rcat "${B}/boot/disk.txt" 2>/dev/null || true
+
+# pipefail fails the pipeline if any stage dies, but a mid-stream pg_dump death still
+# leaves a truncated object in R2 — the remote read-back below is what gates promotion.
+if ! sudo -u postgres pg_dump --clean --if-exists discourse 2>/tmp/cf-pgdump.err | gzip -6 | rclone rcat "${B}/${obj}" 2>/tmp/cf-rclone.err; then
+  status FAIL "stream: pg_dump: $(tail -c 200 /tmp/cf-pgdump.err | tr '\n' ' ') rclone: $(tail -c 100 /tmp/cf-rclone.err | tr '\n' ' ')"
+  rclone deletefile "${B}/${obj}" 2>/dev/null || true
   exit 1
 fi
-sz=$(stat -c %s "$tmp" 2>/dev/null || echo 0)
-[ "$sz" -gt 1000 ] || { status FAIL "dump too small (${sz} bytes)"; exit 1; }
 
-if ! rclone copyto "$tmp" "r2:${CF_BACKUP_BUCKET}/pg/backup-${ts}.sql.gz" 2>/tmp/cf-rclone.err; then
-  status FAIL "upload: $(tail -c 300 /tmp/cf-rclone.err | tr '\n' ' ')"
+sz=$(rclone size "${B}/${obj}" --json 2>/dev/null | grep -o '"bytes":[0-9-]*' | cut -d: -f2)
+if ! [ "${sz:-0}" -gt 1000 ] 2>/dev/null; then
+  status FAIL "streamed object is ${sz:-unknown} bytes"
+  rclone deletefile "${B}/${obj}" 2>/dev/null || true
+  exit 1
+fi
+
+# Verify FROM THE REMOTE: gunzip the whole object (end-to-end gzip integrity — any
+# truncation or corruption fails the stream) and require pg_dump's own end-of-dump
+# marker, which a cut-short dump can never carry. tail consumes the entire stream
+# before emitting, so grep's early exit cannot SIGPIPE the upstream stages.
+if ! rclone cat "${B}/${obj}" 2>/dev/null | gunzip 2>/dev/null | tail -c 400 | grep -q "PostgreSQL database dump complete"; then
+  status FAIL "read-back verification failed (truncated or corrupt) — deleting ${obj}"
+  rclone deletefile "${B}/${obj}" 2>/dev/null || true
   exit 1
 fi
 
 # Shrink guard. A container that boots with a failed restore contains a fresh, nearly
 # empty Discourse; without this it would dump that and overwrite the only good backup,
-# after which every later boot faithfully restores an empty forum. The timestamped copy
-# above is always kept, so nothing is lost either way.
-prev=$(rclone size "r2:${CF_BACKUP_BUCKET}/pg/latest.sql.gz" --json 2>/dev/null | grep -o '"bytes":[0-9-]*' | cut -d: -f2)
+# after which every later boot faithfully restores an empty forum. The timestamped
+# object is kept either way for forensics.
+prev=$(rclone size "${B}/pg/latest.sql.gz" --json 2>/dev/null | grep -o '"bytes":[0-9-]*' | cut -d: -f2)
 if [ -n "${prev:-}" ] && [ "${prev:-0}" -gt 0 ] 2>/dev/null && [ "$sz" -lt $(( prev / 2 )) ]; then
   status REFUSED "dump ${sz}B is under half of existing latest ${prev}B — keeping the old latest, saved as backup-${ts}"
   exit 1
 fi
 
-rclone copyto "$tmp" "r2:${CF_BACKUP_BUCKET}/pg/latest.sql.gz" 2>/dev/null || { status FAIL "latest upload failed"; exit 1; }
+# Promotion is a server-side copy of the already-verified object — the bytes that
+# become latest are the exact bytes that passed read-back, not a second upload.
+if ! rclone copyto "${B}/${obj}" "${B}/pg/latest.sql.gz" 2>/tmp/cf-rclone.err; then
+  status FAIL "promote: $(tail -c 200 /tmp/cf-rclone.err | tr '\n' ' ')"
+  exit 1
+fi
 
 # Record the largest post count this forum has ever had, so a restore can recognise a
 # truncated dump instead of trusting any non-empty database.
 posts=$(sudo -u postgres psql -tAc "select count(*) from posts" discourse 2>/dev/null | tr -dc '0-9')
-hw=$(rclone cat "r2:${CF_BACKUP_BUCKET}/boot/high-water.txt" 2>/dev/null | tr -dc '0-9')
+hw=$(rclone cat "${B}/boot/high-water.txt" 2>/dev/null | tr -dc '0-9')
 if [ -n "${posts:-}" ] && [ "${posts:-0}" -gt "${hw:-0}" ] 2>/dev/null; then
-  printf '%s\n' "$posts" | rclone rcat "r2:${CF_BACKUP_BUCKET}/boot/high-water.txt" 2>/dev/null || true
+  printf '%s\n' "$posts" | rclone rcat "${B}/boot/high-water.txt" 2>/dev/null || true
 fi
-rclone delete "r2:${CF_BACKUP_BUCKET}/pg" --include "backup-*" --min-age 14d 2>/dev/null || true
 
-status OK "pg/backup-${ts}.sql.gz ($(numfmt --to=iec "$sz" 2>/dev/null || echo "${sz}B"))"
+# Tiered retention: three days of 15-minute granularity plus thirty days of dailies.
+# (Weeks of quarter-hour dumps of a non-trivial forum is a surprising R2 bill —
+# dailies cover the slow-burn cases at a fraction of the storage.) The daily keeper
+# is a server-side copy of the just-verified object, minted once per UTC day.
+day=$(date -u +%Y%m%d)
+if ! rclone lsf "${B}/pg/daily-${day}.sql.gz" 2>/dev/null | grep -q .; then
+  rclone copyto "${B}/${obj}" "${B}/pg/daily-${day}.sql.gz" 2>/dev/null || true
+fi
+rclone delete "${B}/pg" --include "backup-*" --min-age 72h 2>/dev/null || true
+rclone delete "${B}/pg" --include "daily-*" --min-age 30d 2>/dev/null || true
+
+status OK "pg/backup-${ts}.sql.gz ($(numfmt --to=iec "$sz" 2>/dev/null || echo "${sz}B"), streamed, ${free_mb}MB disk free)"

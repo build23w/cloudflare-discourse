@@ -23,26 +23,91 @@ latest="r2:${CF_BACKUP_BUCKET}/pg/latest.sql.gz"
 
 # `rclone size` is used instead of `lsf` deliberately: lsf on a file path can return
 # empty, which previously read as "no backup exists" and seeded a fresh forum.
-bytes=$(rclone size "$latest" --json 2>/tmp/cf-size.err | grep -o '"bytes":[0-9-]*' | cut -d: -f2)
-if [ -z "${bytes:-}" ] || [ "${bytes:-0}" -le 0 ] 2>/dev/null; then
-  if grep -qi "not found\|directory not found\|doesn't exist" /tmp/cf-size.err 2>/dev/null; then
-    status NONE "no backup in R2 — first boot, fresh database is correct"
+# Existence is decided on rclone's EXIT CODE plus the parsed byte count — never on
+# stderr text, whose wording shifts across rclone versions and which also carries
+# unrelated NOTICE lines; a text match there once turned a transient error into
+# "first boot" and seeded a fresh forum over a live one. rc 3/4 (directory/file not
+# found) is a definitive absence; anything else that keeps failing means R2 cannot be
+# read, and with a backup possibly present the only safe answer is refusing to serve.
+rc=1
+bytes=""
+for attempt in 1 2 3; do
+  out=$(rclone size "$latest" --json 2>/tmp/cf-size.err)
+  rc=$?
+  bytes=$(printf '%s' "$out" | grep -o '"bytes":[0-9-]*' | cut -d: -f2)
+  if [ "$rc" -eq 0 ] && [ -n "${bytes:-}" ]; then break; fi
+  if [ "$rc" -eq 3 ] || [ "$rc" -eq 4 ]; then
+    status NONE "no backup in R2 (rclone rc=${rc}) — first boot, fresh database is correct"
     exit 3
   fi
-  status FAIL "cannot determine backup size: $(tail -c 200 /tmp/cf-size.err | tr '\n' ' ')"
+  [ "$attempt" -lt 3 ] && sleep 5
+done
+if [ "$rc" -ne 0 ] || [ -z "${bytes:-}" ]; then
+  status FAIL "cannot determine backup size after ${attempt} tries (rc=${rc}): $(tail -c 200 /tmp/cf-size.err | tr '\n' ' ')"
+  exit 1
+fi
+if [ "${bytes}" -eq 0 ] 2>/dev/null; then
+  status NONE "backup object absent (clean zero-byte answer) — first boot, fresh database is correct"
+  exit 3
+fi
+if ! [ "${bytes}" -gt 0 ] 2>/dev/null; then
+  # e.g. bytes=-1: rclone answered but does not know the size — unknown, not absent.
+  status FAIL "unusable backup size '${bytes}' from rclone"
   exit 1
 fi
 status START "restoring ${bytes} bytes from pg/latest.sql.gz"
 
-if ! rclone cat "$latest" | gunzip | sudo -u postgres psql -q -v ON_ERROR_STOP=0 discourse >/tmp/cf-restore.log 2>&1; then
+# --single-transaction: the restore applies COMPLETELY or NOT AT ALL. An interrupted
+# restore can otherwise leave tables and data in place with the dump's entire tail —
+# every primary key and constraint — unapplied, and every backup taken afterwards
+# faithfully dumps the crippled schema. All-or-nothing makes that impossible:
+# a killed restore rolls back, the guard below refuses, runit retries clean.
+if ! rclone cat "$latest" | gunzip | sudo -u postgres psql -q --single-transaction -v ON_ERROR_STOP=1 discourse >/tmp/cf-restore.log 2>&1; then
   status FAIL "psql restore pipeline failed: $(tail -c 300 /tmp/cf-restore.log | tr '\n' ' ')"
   exit 1
 fi
 
-posts=$(sudo -u postgres psql -tAc "select count(*) from posts" discourse 2>/dev/null || echo 0)
-users=$(sudo -u postgres psql -tAc "select count(*) from users" discourse 2>/dev/null || echo 0)
-if ! [ "${posts:-0}" -gt 0 ] 2>/dev/null; then
+# Schema canary: content counts cannot see a constraint-less restore, so check the
+# schema directly — scoped to the application schema, so extension or system-catalog
+# constraints can never pad a gutted 'public' past the floor. themes_pkey is the one
+# whose absence provably breaks Rails.
+pks=$(sudo -u postgres psql -tAc "select count(*) from pg_constraint c join pg_class r on r.oid=c.conrelid join pg_namespace n on n.oid=r.relnamespace where c.contype='p' and n.nspname='public'" discourse 2>/dev/null | tr -dc '0-9')
+if [ "${pks:-0}" -lt 100 ] 2>/dev/null; then
+  status FAIL "restore left only ${pks:-0} primary keys — schema is incomplete, refusing to serve"
+  exit 1
+fi
+
+# Count reliably: a psql that ERRORS (empty output, non-zero rc) must never be read
+# as "0 rows" — that can report a healthy restore of thousands of users as "0 users"
+# and would, with a naive guard, refuse a good restore. Retry, and only trust a number
+# that comes back with a clean exit. "ERR" means unknown, which is treated as
+# not-a-failure below.
+count_rows() {
+  local out
+  for _ in 1 2 3 4; do
+    if out=$(sudo -u postgres psql -tAc "select count(*) from $1" discourse 2>/dev/null) && [ -n "$out" ]; then
+      printf '%s' "$out" | tr -dc '0-9'; return 0
+    fi
+    sleep 2
+  done
+  printf 'ERR'
+}
+posts=$(count_rows posts)
+users=$(count_rows users)
+# ERR means the count itself failed, not that the forum is empty: skip this guard and
+# let the pk canary above and the high-water check below carry the verdict, instead of
+# refusing a possibly good restore over an unknown number.
+if [ "$posts" = "ERR" ]; then
+  echo "[cf-restore] posts count unavailable — skipping the empty-forum guard"
+elif ! [ "${posts:-0}" -gt 0 ] 2>/dev/null; then
   status FAIL "restore produced an empty forum (posts=${posts} users=${users}): $(tail -c 300 /tmp/cf-restore.log | tr '\n' ' ')"
+  exit 1
+fi
+# A forum with thousands of posts but almost no users is a partial restore (users load
+# before posts, so posts can survive a failed users COPY). Guard it — but only on a
+# TRUSTWORTHY count, never on "ERR", so a flaky count can't brick an otherwise-good boot.
+if [ "$users" != "ERR" ] && [ "${posts}" -gt 1000 ] 2>/dev/null && [ "${users}" -lt 10 ] 2>/dev/null; then
+  status FAIL "restored ${posts} posts but only ${users} users — inconsistent, refusing a partial restore"
   exit 1
 fi
 
@@ -55,4 +120,10 @@ if [ -n "${hw:-}" ] && [ "${hw:-0}" -gt 0 ] 2>/dev/null && [ "$posts" -lt $(( hw
   exit 1
 fi
 
-status OK "restored ${posts} posts / ${users} users"
+# A restore rewinds email bookkeeping; without this, the digest scheduler sees a
+# backlog and mass-mails every eligible user after each boot — a fast path to an
+# SMTP-provider suspension. Advancing the attempt stamp suppresses only the
+# catch-up volley: each user's next real digest still goes out on schedule.
+sudo -u postgres psql -qc "UPDATE user_stats SET digest_attempted_at = CURRENT_TIMESTAMP" discourse 2>/dev/null   || echo "[cf-restore] warning: could not advance digest stamps"
+
+status OK "restored ${posts} posts / ${users} users / ${pks} primary keys"
